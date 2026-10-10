@@ -12,6 +12,32 @@ import job_search_agent as agent
 
 
 class JobSearchAgentTests(unittest.TestCase):
+    def test_verified_smb_requires_explicit_size_at_or_below_500(self):
+        self.assertTrue(
+            agent._is_verified_smb(
+                "51-200 employees", "Acme has 51-200 employees."
+            )
+        )
+        self.assertTrue(
+            agent._is_verified_smb("500 employees", "Acme has 500 employees.")
+        )
+        self.assertFalse(
+            agent._is_verified_smb(
+                "201-1,000 employees", "Acme has 201-1,000 employees."
+            )
+        )
+        self.assertFalse(
+            agent._is_verified_smb(
+                "501 employees", "Acme has 501 employees."
+            )
+        )
+        self.assertFalse(
+            agent._is_verified_smb("Not verified", "No employee count found.")
+        )
+        self.assertFalse(
+            agent._is_verified_smb("51-200 employees", "No employee count found.")
+        )
+
     def test_extract_search_queries_validates_and_deduplicates(self):
         with patch.object(
             agent,
@@ -50,10 +76,30 @@ class JobSearchAgentTests(unittest.TestCase):
         with patch.object(
             agent,
             "_ollama_generate",
-            return_value=json.dumps(
+            side_effect=[
+                json.dumps(
+                    {
+                        "is_individual_posting": True,
+                        "industry_match": True,
+                        "location_match": "match",
+                        "posting_location": "Remote",
+                        "requirements": [
+                            {
+                                "criterion": "SQL",
+                                "priority": "essential",
+                                "status": "met",
+                                "evidence": "SQL",
+                            }
+                        ],
+                        "summary": "Strong match",
+                    }
+                ),
+                json.dumps(
                 {
                     "is_individual_posting": True,
                     "industry_match": True,
+                    "location_match": "match",
+                    "posting_location": "Remote",
                     "requirements": [
                         {
                             "criterion": "SQL",
@@ -64,10 +110,60 @@ class JobSearchAgentTests(unittest.TestCase):
                     ],
                     "summary": "Strong match",
                 }
-            ),
+                ),
+            ],
         ):
             with self.assertRaisesRegex(RuntimeError, "invalid requirement"):
                 agent.assess_posting("resume", posting, "llama3.2:3b", "http://localhost:11434")
+
+    def test_assess_posting_retries_incomplete_model_assessment_once(self):
+        posting = agent.Posting(
+            "1",
+            "Research Engineer",
+            "Waabi",
+            "Toronto",
+            "Develop research prototypes using machine learning.",
+            "https://jobs.example/research-engineer",
+        )
+        incomplete = {
+            "is_individual_posting": True,
+            "requirements": [],
+            "summary": "Research role identified.",
+        }
+        valid = {
+            "is_individual_posting": True,
+            "industry_match": True,
+            "location_match": "match",
+            "posting_location": "Toronto, Canada",
+            "employer_name": "Waabi",
+            "requirements": [
+                {
+                    "criterion": "Machine learning research",
+                    "priority": "preferred",
+                    "status": "met",
+                    "evidence": "Built machine learning prototypes.",
+                }
+            ],
+            "summary": "The role aligns with the candidate's research experience.",
+        }
+        with patch.object(
+            agent,
+            "_ollama_generate",
+            side_effect=[json.dumps(incomplete), json.dumps(valid)],
+        ) as generate:
+            assessment = agent.assess_posting(
+                "Built machine learning prototypes.",
+                posting,
+                "llama3.2:3b",
+                "http://localhost:11434",
+                "autonomous vehicles",
+            )
+
+        self.assertTrue(assessment.qualified)
+        self.assertEqual(assessment.posting.company, "Waabi")
+        self.assertEqual(assessment.score, 100)
+        self.assertEqual(generate.call_count, 2)
+        self.assertIn("Return only the corrected JSON object", generate.call_args.args[0])
 
     def test_create_report_includes_all_postings_and_marks_qualification(self):
         qualified = agent.Posting(
@@ -106,7 +202,7 @@ class JobSearchAgentTests(unittest.TestCase):
             "1",
             "Analyst",
             "Acme",
-            "Remote",
+            "Toronto, Ontario, Canada",
             "Build reports",
             "https://example.com/job",
             80000,
@@ -131,6 +227,10 @@ class JobSearchAgentTests(unittest.TestCase):
                 rows = list(csv.DictReader(csv_file))
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["title"], "Analyst")
+        self.assertEqual(rows[0]["location"], "Toronto, Ontario, Canada")
+        self.assertEqual(rows[0]["location_match"], "unclear")
+        self.assertEqual(rows[0]["company_size"], "Not verified")
+        self.assertEqual(rows[0]["hiring_status"], "Not verified")
         self.assertEqual(rows[0]["salary_max"], "95000")
         self.assertEqual(rows[0]["required_coverage"], "100")
         self.assertEqual(rows[0]["preferred_coverage"], "33")
@@ -145,6 +245,76 @@ class JobSearchAgentTests(unittest.TestCase):
         rejected_row = next(row for row in rows if row["title"] == "Engineer")
         self.assertEqual(rejected_row["qualified"], "False")
         self.assertEqual(rejected_row["meets_threshold"], "False")
+
+    def test_verify_employer_facts_records_size_and_individual_opening_evidence(self):
+        assessment = agent.Assessment(
+            agent.Posting(
+                "1",
+                "Data Engineer",
+                "Acme",
+                "Remote",
+                "Build data pipelines.",
+                "https://acme.example/jobs/data-engineer",
+            ),
+            80,
+            True,
+            "Strong match",
+            ["Python"],
+            [],
+        )
+        search = Mock()
+        search.results.side_effect = [
+            [
+                {
+                    "title": "Acme company size",
+                    "link": "https://directory.example/acme",
+                    "snippet": "Acme has 51-200 employees.",
+                }
+            ],
+            [
+                {
+                    "title": "Data Engineer at Acme",
+                    "link": "https://acme.example/jobs/data-engineer",
+                    "snippet": "Acme is hiring a Data Engineer. Apply now.",
+                }
+            ],
+        ]
+        with patch(
+            "langchain_community.utilities.DuckDuckGoSearchAPIWrapper",
+            return_value=search,
+        ):
+            result = agent.verify_employer_facts([assessment])
+
+        posting = result[0].posting
+        self.assertEqual(posting.company_size, "51-200 employees")
+        self.assertEqual(posting.company_size_url, "https://directory.example/acme")
+        self.assertIn("51-200 employees", posting.company_size_evidence)
+        self.assertEqual(
+            posting.hiring_status,
+            "Individual posting found in search; active status not confirmed",
+        )
+        self.assertEqual(
+            posting.hiring_evidence_url,
+            "https://acme.example/jobs/data-engineer",
+        )
+        self.assertEqual(search.results.call_count, 2)
+
+    def test_verify_employer_facts_keeps_unknown_when_employer_is_not_identified(self):
+        assessment = agent.Assessment(
+            agent.Posting(
+                "1", "Analyst", "See posting", "Remote", "", "https://example.com/job"
+            ),
+            50,
+            False,
+            "Unknown",
+            [],
+            [],
+        )
+        with patch("langchain_community.utilities.DuckDuckGoSearchAPIWrapper") as search:
+            result = agent.verify_employer_facts([assessment])
+        self.assertEqual(result[0].posting.company_size, "Not verified")
+        self.assertEqual(result[0].posting.hiring_status, "Not verified")
+        search.assert_not_called()
 
     def test_link_verification_visits_url_and_records_redirect(self):
         posting = agent.Posting(
@@ -247,9 +417,28 @@ class JobSearchAgentTests(unittest.TestCase):
         self.assertEqual(jobs[0].url, "https://example.com/job")
         self.assertIsNone(jobs[0].salary_min)
         generate.assert_not_called()
-        search_wrapper_class.assert_called_once_with()
-        search_wrapper.results.assert_called_once_with(
-            "analyst job opening apply Remote healthcare", max_results=5
+        search_wrapper_class.assert_called_once_with(
+            backend="bing,brave,google,mojeek,yahoo"
+        )
+        self.assertEqual(
+            [call.args for call in search_wrapper.results.call_args_list],
+            [
+                (
+                    "analyst job opening apply Remote healthcare",
+                ),
+                (
+                    "site:indeed.com/viewjob analyst job opening apply Remote healthcare",
+                ),
+                (
+                    'analyst job opening apply Remote healthcare startup OR "small business" OR SMB',
+                ),
+            ],
+        )
+        self.assertTrue(
+            all(
+                call.kwargs == {"max_results": 5}
+                for call in search_wrapper.results.call_args_list
+            )
         )
 
     def test_fetch_jobs_discards_indeed_search_page_but_keeps_direct_job(self):
@@ -317,6 +506,49 @@ class JobSearchAgentTests(unittest.TestCase):
             )
         self.assertEqual(jobs, [])
 
+    def test_fetch_jobs_treats_backend_no_results_as_empty_and_continues(self):
+        search_wrapper = Mock()
+        search_wrapper.results.side_effect = [
+            RuntimeError("No results found."),
+            [
+                {
+                    "title": "Analyst - Acme",
+                    "link": "https://acme.example/jobs/analyst",
+                    "snippet": "Acme is hiring an analyst.",
+                }
+            ],
+            [
+                {
+                    "title": "Analyst - Acme",
+                    "link": "https://acme.example/jobs/analyst",
+                    "snippet": "Acme is hiring an analyst.",
+                }
+            ],
+        ]
+        with patch(
+            "langchain_community.utilities.DuckDuckGoSearchAPIWrapper",
+            return_value=search_wrapper,
+        ):
+            jobs = agent.fetch_jobs(["analyst"], "Canada", 5)
+        self.assertEqual(
+            [job.url for job in jobs], ["https://acme.example/jobs/analyst"]
+        )
+        self.assertEqual(search_wrapper.results.call_count, 3)
+
+    def test_fetch_jobs_reports_network_errors_with_actionable_context(self):
+        search_wrapper = Mock()
+        search_wrapper.results.side_effect = RuntimeError(
+            "DNS resolution failed for search.example"
+        )
+        with patch(
+            "langchain_community.utilities.DuckDuckGoSearchAPIWrapper",
+            return_value=search_wrapper,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "Check your internet/DNS connection"
+            ):
+                agent.fetch_jobs(["analyst"], "Canada", 5)
+
     def test_fetch_jobs_any_industry_does_not_add_sector_filter(self):
         search_wrapper = Mock()
         search_wrapper.results.return_value = [
@@ -331,15 +563,164 @@ class JobSearchAgentTests(unittest.TestCase):
             return_value=search_wrapper,
         ):
             agent.fetch_jobs(["data analyst"], "Remote", 5, "any")
-        search_wrapper.results.assert_called_once_with(
-            "data analyst job opening apply Remote", max_results=5
+        self.assertEqual(
+            [call.args[0] for call in search_wrapper.results.call_args_list],
+            [
+                "data analyst job opening apply Remote",
+                "site:indeed.com/viewjob data analyst job opening apply Remote",
+                'data analyst job opening apply Remote startup OR "small business" OR SMB',
+            ],
         )
+        self.assertTrue(
+            all(
+                call.kwargs == {"max_results": 5}
+                for call in search_wrapper.results.call_args_list
+            )
+        )
+
+    def test_fetch_jobs_reserves_results_for_startups_and_smbs(self):
+        general_results = [
+            {
+                "title": f"General role {index}",
+                "link": f"https://company{index}.example/jobs/role-{index}",
+                "snippet": "Hiring for a role.",
+            }
+            for index in range(1, 5)
+        ]
+        startup_results = [
+            {
+                "title": "Startup Data Analyst",
+                "link": "https://startup.example/jobs/data-analyst",
+                "snippet": "Early-stage startup hiring a data analyst.",
+            }
+        ]
+        search_wrapper = Mock()
+        search_wrapper.results.side_effect = [general_results, [], startup_results]
+        with patch(
+            "langchain_community.utilities.DuckDuckGoSearchAPIWrapper",
+            return_value=search_wrapper,
+        ):
+            jobs = agent.fetch_jobs(["data analyst"], "Remote", 3)
+        self.assertEqual(
+            [job.url for job in jobs],
+            [
+                "https://company1.example/jobs/role-1",
+                "https://startup.example/jobs/data-analyst",
+                "https://company2.example/jobs/role-2",
+            ],
+        )
+        self.assertIn("startup OR", search_wrapper.results.call_args_list[2].args[0])
+
+    def test_fetch_jobs_searches_indeed_for_direct_postings(self):
+        search_wrapper = Mock()
+        search_wrapper.results.side_effect = [
+            [],
+            [
+                {
+                    "title": "Data Analyst - Acme",
+                    "link": "https://ca.indeed.com/viewjob?jk=abc123",
+                    "snippet": "Acme is hiring a data analyst.",
+                }
+            ],
+            [],
+        ]
+        with patch(
+            "langchain_community.utilities.DuckDuckGoSearchAPIWrapper",
+            return_value=search_wrapper,
+        ):
+            jobs = agent.fetch_jobs(["data analyst"], "Canada", 3)
+
+        self.assertEqual(
+            [job.url for job in jobs],
+            ["https://ca.indeed.com/viewjob?jk=abc123"],
+        )
+        self.assertEqual(
+            search_wrapper.results.call_args_list[1].args[0],
+            "site:indeed.com/viewjob data analyst job opening apply Canada",
+        )
+
+    def test_fetch_jobs_smb_only_targets_the_selected_industry(self):
+        search_wrapper = Mock()
+        search_wrapper.results.return_value = []
+        with patch(
+            "langchain_community.utilities.DuckDuckGoSearchAPIWrapper",
+            return_value=search_wrapper,
+        ):
+            agent.fetch_jobs(
+                ["aerospace engineer"],
+                "Canada",
+                5,
+                "aerospace",
+                smb_only=True,
+            )
+
+        smb_query = search_wrapper.results.call_args_list[2].args[0]
+        self.assertIn('"aerospace"', smb_query)
+        self.assertIn('"small business" OR startup OR "under 500 employees"', smb_query)
+
+    def test_fetch_jobs_smb_only_searches_direct_job_board_postings(self):
+        lever_posting = {
+            "title": "Lead Satellite Systems Engineer - Kepler",
+            "link": "https://jobs.lever.co/kepler/223eeef2-f0e0-4656-a6d0-538074670f6d",
+            "snippet": "Kepler Communications is hiring a Lead Satellite Systems Engineer.",
+        }
+        job_bank_posting = {
+            "title": "Aerospace Engineer - Halifax - Job posting - Job Bank",
+            "link": "https://www.jobbank.gc.ca/jobsearch/jobposting/48212273",
+            "snippet": "Aerospace Engineer position in Canada.",
+        }
+        search_wrapper = Mock()
+        search_wrapper.results.side_effect = [
+            [],
+            [],
+            [],
+            [lever_posting],
+            [],
+            [job_bank_posting],
+        ]
+        with patch(
+            "langchain_community.utilities.DuckDuckGoSearchAPIWrapper",
+            return_value=search_wrapper,
+        ):
+            jobs = agent.fetch_jobs(
+                ["aerospace engineer"],
+                "Canada",
+                5,
+                "aerospace",
+                smb_only=True,
+            )
+
+        self.assertEqual(
+            {job.url for job in jobs},
+            {
+                lever_posting["link"],
+                job_bank_posting["link"],
+            },
+        )
+        queries = [call.args[0] for call in search_wrapper.results.call_args_list]
+        self.assertIn(
+            "site:jobs.lever.co aerospace engineer Canada aerospace",
+            queries,
+        )
+        self.assertIn(
+            "site:jobbank.gc.ca/jobsearch/jobposting "
+            "aerospace engineer Canada aerospace",
+            queries,
+        )
+
+    def test_parser_exposes_smb_only_option(self):
+        args = agent.build_parser().parse_args(
+            ["--resume", "resume.pdf", "--industry", "aerospace", "--smb-focus"]
+        )
+        self.assertTrue(args.smb_only)
 
     def test_assess_posting_includes_target_industry(self):
         posting = agent.Posting("1", "Analyst", "Acme", "Remote", "Analyze data", "https://example.com")
         response = {
             "is_individual_posting": True,
             "industry_match": True,
+            "location_match": "match",
+            "posting_location": "Remote",
             "requirements": [
                 {
                     "criterion": "Analysis",
@@ -360,6 +741,123 @@ class JobSearchAgentTests(unittest.TestCase):
         self.assertIn("do not treat search/category pages", generate.call_args.args[0])
         self.assertIn("https://example.com", generate.call_args.args[0])
 
+    def test_assess_posting_prompt_compares_each_requested_location_level(self):
+        posting = agent.Posting(
+            "1",
+            "Engineer",
+            "Acme",
+            "Toronto, Ontario, Canada",
+            "Engineer in Ottawa, Ontario, Canada.",
+            "https://example.com/job",
+        )
+        response = {
+            "is_individual_posting": True,
+            "industry_match": True,
+            "location_match": "mismatch",
+            "posting_location": "Ottawa, Ontario, Canada",
+            "requirements": [
+                {
+                    "criterion": "Engineering",
+                    "priority": "preferred",
+                    "status": "met",
+                    "evidence": "Engineering experience.",
+                }
+            ],
+            "summary": "Ottawa is not the requested city, Toronto.",
+        }
+        with patch.object(
+            agent, "_ollama_generate", return_value=json.dumps(response)
+        ) as generate:
+            assessment = agent.assess_posting(
+                "Engineering experience.",
+                posting,
+                "llama3.2:3b",
+                "http://localhost:11434",
+            )
+
+        prompt = generate.call_args.args[0]
+        self.assertIn(
+            "Every supplied component must match",
+            prompt,
+        )
+        self.assertIn(
+            "city in the same province is a mismatch",
+            prompt,
+        )
+        self.assertFalse(assessment.qualified)
+        self.assertEqual(assessment.posting.location, "Ottawa, Ontario, Canada")
+
+    def test_assess_posting_identifies_and_rejects_explicit_location_mismatch(self):
+        posting = agent.Posting(
+            "1",
+            "Research Engineer",
+            "Waabi",
+            "Canada",
+            "Research Engineer. Boston, MA, USA. Experience with robotics.",
+            "https://jobs.example/research-engineer",
+        )
+        response = {
+            "is_individual_posting": True,
+            "industry_match": True,
+            "location_match": "mismatch",
+            "posting_location": "Boston, MA, USA",
+            "employer_name": "Waabi",
+            "requirements": [
+                {
+                    "criterion": "Robotics experience",
+                    "priority": "preferred",
+                    "status": "met",
+                    "evidence": "Worked with robotics.",
+                }
+            ],
+            "summary": "The role is based in Boston, not Canada.",
+        }
+        with patch.object(
+            agent, "_ollama_generate", return_value=json.dumps(response)
+        ) as generate:
+            assessment = agent.assess_posting(
+                "Worked with robotics.",
+                posting,
+                "llama3.2:3b",
+                "http://localhost:11434",
+            )
+
+        self.assertFalse(assessment.qualified)
+        self.assertEqual(assessment.location_match, "mismatch")
+        self.assertEqual(assessment.posting.location, "Boston, MA, USA")
+        self.assertIn("Requested search location: Canada", generate.call_args.args[0])
+
+    def test_assess_posting_marks_unknown_actual_location(self):
+        posting = agent.Posting(
+            "1", "Analyst", "Acme", "Canada", "Analyze data.", "https://example.com/job"
+        )
+        response = {
+            "is_individual_posting": True,
+            "industry_match": True,
+            "location_match": "unclear",
+            "posting_location": None,
+            "requirements": [
+                {
+                    "criterion": "Data analysis",
+                    "priority": "preferred",
+                    "status": "met",
+                    "evidence": "Analyzed datasets.",
+                }
+            ],
+            "summary": "The location isn't specified in the source text.",
+        }
+        with patch.object(
+            agent, "_ollama_generate", return_value=json.dumps(response)
+        ):
+            assessment = agent.assess_posting(
+                "Analyzed datasets.",
+                posting,
+                "llama3.2:3b",
+                "http://localhost:11434",
+            )
+        self.assertEqual(assessment.posting.location, "Not verified")
+        self.assertEqual(assessment.location_match, "unclear")
+
     def test_assess_posting_calculates_weighted_requirements_score(self):
         posting = agent.Posting(
             "1", "Analyst", "Acme", "Remote", "SQL and reporting", "https://example.com/job"
@@ -367,6 +865,8 @@ class JobSearchAgentTests(unittest.TestCase):
         response = {
             "is_individual_posting": True,
             "industry_match": True,
+            "location_match": "match",
+            "posting_location": "Remote",
             "requirements": [
                 {
                     "criterion": "SQL",
@@ -415,6 +915,8 @@ class JobSearchAgentTests(unittest.TestCase):
         response = {
             "is_individual_posting": True,
             "industry_match": True,
+            "location_match": "match",
+            "posting_location": "Remote",
             "requirements": [],
             "summary": "The snippet is too short.",
         }
@@ -435,6 +937,8 @@ class JobSearchAgentTests(unittest.TestCase):
         response = {
             "is_individual_posting": True,
             "industry_match": True,
+            "location_match": "match",
+            "posting_location": "Remote",
             "requirements": [
                 {
                     "criterion": "Analysis",
@@ -551,6 +1055,7 @@ class JobSearchAgentTests(unittest.TestCase):
             )
             with patch.dict("os.environ", {}, clear=True):
                 with (
+                    patch.object(agent, "ensure_ollama_running"),
                     patch.object(agent, "extract_search_queries", return_value=["analyst"]),
                     patch.object(agent, "fetch_jobs", return_value=[]),
                     patch.object(agent, "verify_posting_links", return_value=[]),
@@ -558,6 +1063,163 @@ class JobSearchAgentTests(unittest.TestCase):
                     self.assertEqual(agent.run(args), 0)
             self.assertTrue(output_docx.is_file())
             self.assertTrue(output_csv.is_file())
+
+    def test_run_excludes_explicitly_mismatched_locations_from_reports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            resume = Path(directory) / "resume.txt"
+            resume.write_text("Resume", encoding="utf-8")
+            output_docx = Path(directory) / "jobs.docx"
+            output_csv = Path(directory) / "jobs.csv"
+            posting = agent.Posting(
+                "1", "Research Engineer", "Waabi", "Canada", "Boston, MA, USA", "https://job.example"
+            )
+            mismatch = agent.Assessment(
+                posting,
+                100,
+                False,
+                "Posting location does not match Canada.",
+                ["Research"],
+                [],
+                location_match="mismatch",
+            )
+            args = Namespace(
+                resume=str(resume),
+                max_results=5,
+                min_score=60,
+                model="llama3.2:3b",
+                ollama_host="http://localhost:11434",
+                location="Canada",
+                industry=None,
+                smb_only=False,
+                output=str(output_docx),
+                csv_output=str(output_csv),
+            )
+            with (
+                patch.object(agent, "ensure_ollama_running"),
+                patch.object(agent, "extract_search_queries", return_value=["engineer"]),
+                patch.object(agent, "fetch_jobs", return_value=[posting]),
+                patch.object(agent, "verify_posting_links", return_value=[posting]),
+                patch.object(agent, "assess_posting", return_value=mismatch),
+            ):
+                self.assertEqual(agent.run(args), 0)
+
+            with output_csv.open(encoding="utf-8-sig", newline="") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual(rows, [])
+
+    def test_run_smb_focus_retains_unverified_size_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            resume = Path(directory) / "resume.txt"
+            resume.write_text("Resume", encoding="utf-8")
+            output_docx = Path(directory) / "jobs.docx"
+            output_csv = Path(directory) / "jobs.csv"
+            postings = [
+                agent.Posting("1", "Engineer", "SmallCo", "Canada", "", "https://small.example/job"),
+                agent.Posting("2", "Engineer", "BigCo", "Canada", "", "https://big.example/job"),
+                agent.Posting("3", "Engineer", "UnknownCo", "Canada", "", "https://unknown.example/job"),
+            ]
+            assessments = [
+                agent.Assessment(posting, 80, True, "Match", [], [])
+                for posting in postings
+            ]
+            verified_assessments = [
+                agent.dataclass_replace(
+                    assessments[0],
+                    posting=agent.dataclass_replace(
+                        assessments[0].posting,
+                        company_size="51-200 employees",
+                        company_size_evidence="SmallCo has 51-200 employees.",
+                    ),
+                ),
+                agent.dataclass_replace(
+                    assessments[1],
+                    posting=agent.dataclass_replace(
+                        assessments[1].posting,
+                        company_size="1,001-5,000 employees",
+                        company_size_evidence="BigCo has 1,001-5,000 employees.",
+                    ),
+                ),
+                assessments[2],
+            ]
+            args = Namespace(
+                resume=str(resume),
+                max_results=5,
+                min_score=60,
+                model="llama3.2:3b",
+                ollama_host="http://localhost:11434",
+                location="Canada",
+                industry="aerospace",
+                smb_only=True,
+                output=str(output_docx),
+                csv_output=str(output_csv),
+            )
+            with (
+                patch.object(agent, "ensure_ollama_running"),
+                patch.object(agent, "extract_search_queries", return_value=["engineer"]),
+                patch.object(agent, "fetch_jobs", return_value=postings) as fetch_jobs,
+                patch.object(agent, "verify_posting_links", return_value=postings),
+                patch.object(agent, "assess_posting", side_effect=assessments),
+                patch.object(
+                    agent,
+                    "verify_employer_facts",
+                    return_value=verified_assessments,
+                ),
+            ):
+                self.assertEqual(agent.run(args), 0)
+
+            fetch_jobs.assert_called_once_with(
+                ["engineer"], "Canada", 5, "aerospace", True
+            )
+            with output_csv.open(encoding="utf-8", newline="") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual(
+                [row["company"] for row in rows], ["SmallCo", "UnknownCo"]
+            )
+            self.assertEqual(rows[1]["company_size"], "Not verified")
+
+    def test_ensure_ollama_running_does_not_start_duplicate_server(self):
+        with (
+            patch.object(agent, "_ollama_api_available", return_value=True),
+            patch.object(agent.subprocess, "Popen") as popen,
+        ):
+            agent.ensure_ollama_running("http://localhost:11434")
+        popen.assert_not_called()
+
+    def test_ensure_ollama_running_starts_local_server_and_waits_for_api(self):
+        process = Mock()
+        process.poll.return_value = None
+        with (
+            patch.object(
+                agent, "_ollama_api_available", side_effect=[False, False, True]
+            ),
+            patch.object(agent.shutil, "which", return_value="/usr/local/bin/ollama"),
+            patch.object(agent.subprocess, "Popen", return_value=process) as popen,
+            patch.object(agent.time, "sleep"),
+        ):
+            agent.ensure_ollama_running("http://localhost:11434", timeout=5)
+
+        self.assertEqual(
+            popen.call_args.args[0], ["/usr/local/bin/ollama", "serve"]
+        )
+        self.assertEqual(popen.call_args.kwargs["stdin"], agent.subprocess.DEVNULL)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_ensure_ollama_running_reports_missing_executable(self):
+        with (
+            patch.object(agent, "_ollama_api_available", return_value=False),
+            patch.object(agent.shutil, "which", return_value=None),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "command was not found"):
+                agent.ensure_ollama_running("http://localhost:11434")
+
+    def test_ensure_ollama_running_does_not_start_remote_server(self):
+        with (
+            patch.object(agent, "_ollama_api_available", return_value=False),
+            patch.object(agent.shutil, "which") as which,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "only auto-starts Ollama"):
+                agent.ensure_ollama_running("http://ollama.example:11434")
+        which.assert_not_called()
 
     def test_parser_exposes_opt_in_resume_tailoring(self):
         args = agent.build_parser().parse_args(
@@ -591,6 +1253,51 @@ class JobSearchAgentTests(unittest.TestCase):
         self.assertEqual(request_data["format"], "json")
         self.assertFalse(request_data["stream"])
         self.assertEqual(result, '{"ok": true}')
+        self.assertEqual(
+            urlopen.call_args.kwargs["timeout"],
+            agent.DEFAULT_OLLAMA_GENERATE_TIMEOUT,
+        )
+
+    def test_ollama_generate_uses_configured_timeout(self):
+        payload = {"response": '{"ok": true}'}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps(payload).encode()
+
+        with (
+            patch.dict("os.environ", {"OLLAMA_GENERATE_TIMEOUT": "900"}),
+            patch.object(agent, "urlopen", return_value=FakeResponse()) as urlopen,
+        ):
+            agent._ollama_generate(
+                "return JSON", "llama3.2:3b", "http://localhost:11434"
+            )
+
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 900)
+
+    def test_ollama_generate_reports_generation_timeout_and_recovery(self):
+        with patch.object(agent, "urlopen", side_effect=TimeoutError("timed out")):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Ollama generation timed out after 600 seconds.*Increase "
+                "OLLAMA_GENERATE_TIMEOUT",
+            ):
+                agent._ollama_generate(
+                    "long prompt", "llama3.2:3b", "http://localhost:11434"
+                )
+
+    def test_ollama_generation_timeout_must_be_positive(self):
+        with patch.dict("os.environ", {"OLLAMA_GENERATE_TIMEOUT": "0"}):
+            with self.assertRaisesRegex(
+                RuntimeError, "OLLAMA_GENERATE_TIMEOUT must be a positive"
+            ):
+                agent._ollama_generate_timeout()
 
 
 if __name__ == "__main__":

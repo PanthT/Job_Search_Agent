@@ -8,7 +8,7 @@ Search terms go to DuckDuckGo; no search API key or OpenRouter/Adzuna account is
 ## Requirements
 
 - Python 3.10+
-- [Ollama](https://ollama.com/) installed and running locally
+- [Ollama](https://ollama.com/) installed locally
 - Internet access for DuckDuckGo search
 
 ## Setup
@@ -25,7 +25,6 @@ Search terms go to DuckDuckGo; no search API key or OpenRouter/Adzuna account is
 
    ```sh
    ollama pull llama3.2:3b
-   ollama serve
    ```
 
    Or use a Qwen model instead:
@@ -33,6 +32,11 @@ Search terms go to DuckDuckGo; no search API key or OpenRouter/Adzuna account is
    ```sh
    ollama pull qwen2.5:3b
    ```
+
+   When you run the agent, it checks whether the local Ollama API is responding. If it
+   is not, the agent starts `ollama serve` automatically and waits for the API before
+   continuing. Keep Ollama installed and ensure the `ollama` command is available in
+   the same terminal environment. You can also start Ollama manually before the agent.
 
 3. Save your resume as UTF-8 plain text (`.txt`), PDF (`.pdf`), or Word (`.docx`).
 
@@ -67,9 +71,78 @@ outside a particular sector:
 python job_search_agent.py --resume ./resume.pdf --industry any
 ```
 
+Use `--location` at the geographic level you want: country only, province/state and
+country, or city, province/state, and country. Every component you provide must match;
+for example, a Toronto search excludes Ottawa even though both cities are in Ontario.
+
+```sh
+# Country-wide search
+python job_search_agent.py --resume ./resume.pdf --location "Canada"
+
+# Province/state-wide search
+python job_search_agent.py --resume ./resume.pdf --location "Ontario, Canada"
+
+# City-specific search
+python job_search_agent.py \
+  --resume ./resume.pdf \
+  --location "Toronto, Ontario, Canada"
+```
+
+The requested `--location` is not treated as proof of a posting's actual location. The
+agent extracts the location stated in each posting and compares each requested
+component. Explicitly mismatched postings are excluded from both reports; when the
+source does not state enough location detail, the report labels it `Not verified`
+rather than copying the search location into the job's location field. Remote jobs are
+included only when the posting says they are eligible in the requested area.
+
+Searches include the broader web, a targeted Indeed query for individual posting pages,
+and a startup/small-business query. The Indeed query uses the resume-derived role terms,
+location, and industry (if set); broad Indeed search/listing pages are still excluded.
+When results are available, roughly one-third of `--max-results` is reserved for Indeed
+postings and another third for startup/small-business leads; unused slots are filled from
+the other searches.
+
+The agent does not start from a fixed list of SMB employers. It searches for roles based
+on the resume-derived job queries, then looks for startup/small-business signals in the
+search results. Once an employer is identified, it searches for explicit employee-count
+and current-hiring evidence. To focus on SMB opportunities in a specific industry, use
+`--smb-focus` together with `--industry` (`--smb-only` remains an alias):
+
+```sh
+python job_search_agent.py \
+  --resume ./resume.pdf \
+  --location Canada \
+  --industry aerospace \
+  --smb-focus
+```
+
+In this mode, the targeted search combines resume-matched job queries with the selected
+industry and SMB/startup terms, and searches direct posting URLs on Lever and Greenhouse
+(plus Canada's Job Bank when the location is Canada). Search diagnostics report raw
+results, individual posting URLs retained, and links filtered as non-postings. Explicit
+evidence of 1-500 employees marks an employer as a verified SMB. Postings whose employer
+size cannot be verified are retained as unverified candidates, so search runs don't
+silently become empty solely because employee-count sources are missing. Employers known
+to have more than 500 employees are excluded. The company-size status and any evidence
+source are included in the CSV/report. This is a conservative discovery aid, not a
+guarantee that search-engine results cover every SMB or that every size source is current.
+
 The default model is `llama3.2:3b`; set `--model` or `OLLAMA_MODEL` to a model you've
 downloaded in Ollama, such as `qwen2.5:3b`. Use `--ollama-host` or `OLLAMA_HOST` if
-Ollama is listening at a non-default local URL.
+Ollama is listening at a non-default local URL. If Ollama returns an assessment that
+does not match the required JSON fields, the agent retries that assessment once; if the
+retry is still invalid, it reports the missing or malformed field names.
+Each local generation request has a 10-minute timeout by default to allow for a cold
+model load or a slower machine. If a request still times out, retry with a longer
+timeout, for example:
+
+```sh
+OLLAMA_GENERATE_TIMEOUT=900 python job_search_agent.py \
+  --resume ./resume.pdf \
+  --location Canada \
+  --industry aerospace \
+  --smb-focus
+```
 
 To generate a separate tailored resume draft for each job marked qualified and meeting
 the minimum score, opt in with `--tailor-resumes`. Drafts are saved as DOCX files in
@@ -89,7 +162,17 @@ credentials, employers, dates, or achievements. Each output is clearly marked as
 AI-assisted draft; review every statement for accuracy before using or submitting it.
 The original resume is not modified.
 
-The CSV includes the posting title, company (when available), location, reported salary,
+For each posting with an identified employer, the agent also searches the web for an
+explicit employee-count statement and current individual openings. Reports include
+employee-count evidence and its source URL, plus any individual opening found in the
+employer-targeted hiring search and its source. Missing evidence is labeled
+`Not verified`; the agent does not infer company size from startup/SMB search terms. A
+search result is a signal, not proof that a job remains open; confirm details on the
+cited source or employer site. If the employer cannot be identified from the job result,
+those facts remain unverified.
+
+The CSV includes the posting title, company (when available), reported employee count
+and source, hiring signal and source, location, reported salary,
 ATS-style `fit_score`, required/preferred coverage, qualification status, fit
 explanation, matching skills, gaps, description, source URL, an `apply_url` to the
 individual posting page, and link-check status/final URL. The Word report also includes
@@ -101,8 +184,13 @@ the job is still open or that its page is genuine.
 
 ## Search limits and privacy
 
-DuckDuckGo search is accessed through LangChain's community integration and does not
-require an API key. The `langchain-community` package is marked as being sunset by
+Web search is accessed through LangChain's community integration and does not require
+an API key. It uses selected search engines instead of `ddgs`'s automatic mode, which
+can query unrelated engines such as Wikipedia and fail when those hosts are unavailable.
+If an individual query produces no results, the agent continues through the remaining
+queries. If all configured backends fail due to network/DNS issues, it reports the
+connection error rather than treating it as an empty search. The `langchain-community`
+package is marked as being sunset by
 LangChain, so this integration may eventually need migration. Search can be throttled
 or change without notice; it is not a guaranteed job-listings API. Search-result and
 category pages are excluded; the agent retains URLs that appear to lead to an individual
