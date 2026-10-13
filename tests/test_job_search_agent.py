@@ -210,6 +210,7 @@ class JobSearchAgentTests(unittest.TestCase):
             True,
             "HTTP 200 - reachable",
             "https://careers.example.com/jobs/123",
+            search_date="2026-10-10",
         )
         failing = agent.Posting(
             "2", "Engineer", "Other", "Remote", "", "https://example.org/job"
@@ -229,6 +230,7 @@ class JobSearchAgentTests(unittest.TestCase):
         self.assertEqual(rows[0]["title"], "Analyst")
         self.assertEqual(rows[0]["location"], "Toronto, Ontario, Canada")
         self.assertEqual(rows[0]["location_match"], "unclear")
+        self.assertEqual(rows[0]["search_date"], "2026-10-10")
         self.assertEqual(rows[0]["company_size"], "Not verified")
         self.assertEqual(rows[0]["hiring_status"], "Not verified")
         self.assertEqual(rows[0]["salary_max"], "95000")
@@ -245,6 +247,31 @@ class JobSearchAgentTests(unittest.TestCase):
         rejected_row = next(row for row in rows if row["title"] == "Engineer")
         self.assertEqual(rejected_row["qualified"], "False")
         self.assertEqual(rejected_row["meets_threshold"], "False")
+
+    def test_create_csv_report_wraps_long_titles_without_truncating(self):
+        title = ("Senior Research Engineer " * 6).strip()
+        assessment = agent.Assessment(
+            agent.Posting(
+                "1", title, "Acme", "Canada", "", "https://example.com/job"
+            ),
+            80,
+            True,
+            "Strong match",
+            [],
+            [],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "jobs.csv"
+            agent.create_csv_report([assessment], output, min_score=60)
+            with output.open(encoding="utf-8-sig", newline="") as csv_file:
+                rows = list(csv.DictReader(csv_file))
+
+        wrapped_title = rows[0]["title"]
+        self.assertIn("\n", wrapped_title)
+        self.assertEqual(" ".join(wrapped_title.splitlines()), title)
+        self.assertTrue(
+            all(len(line) <= 100 for line in wrapped_title.splitlines())
+        )
 
     def test_verify_employer_facts_records_size_and_individual_opening_evidence(self):
         assessment = agent.Assessment(
@@ -415,6 +442,10 @@ class JobSearchAgentTests(unittest.TestCase):
         self.assertEqual(jobs[0].location, "Remote")
         self.assertEqual(jobs[0].description, "Acme analyst role. Analyze data.")
         self.assertEqual(jobs[0].url, "https://example.com/job")
+        self.assertEqual(
+            jobs[0].search_date,
+            agent.datetime.now().astimezone().date().isoformat(),
+        )
         self.assertIsNone(jobs[0].salary_min)
         generate.assert_not_called()
         search_wrapper_class.assert_called_once_with(

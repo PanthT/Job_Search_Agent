@@ -12,6 +12,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace as dataclass_replace
@@ -157,6 +158,7 @@ class Posting:
     hiring_status: str = "Not verified"
     hiring_evidence: str = ""
     hiring_evidence_url: str = ""
+    search_date: str = ""
 
 
 @dataclass(frozen=True)
@@ -515,6 +517,7 @@ def fetch_jobs(
         "industry_boards": [],
     }
     search = _create_web_search()
+    search_date = datetime.now().astimezone().date().isoformat()
     raw_result_count = 0
     rejected_result_count = 0
     for query in queries:
@@ -705,6 +708,7 @@ def fetch_jobs(
                 location=location,
                 description=source["content"],
                 url=url.strip(),
+                search_date=search_date,
             )
         )
     return postings
@@ -1370,6 +1374,7 @@ def create_csv_report(
         "hiring_status",
         "hiring_evidence",
         "hiring_evidence_source",
+        "search_date",
         "location",
         "location_match",
         "salary_min",
@@ -1406,7 +1411,12 @@ def create_csv_report(
             posting = assessment.posting
             writer.writerow(
                 {
-                    "title": posting.title,
+                    "title": textwrap.fill(
+                        posting.title,
+                        width=100,
+                        break_long_words=True,
+                        break_on_hyphens=False,
+                    ),
                     "company": posting.company,
                     "company_size": posting.company_size,
                     "company_size_evidence": posting.company_size_evidence,
@@ -1414,6 +1424,7 @@ def create_csv_report(
                     "hiring_status": posting.hiring_status,
                     "hiring_evidence": posting.hiring_evidence,
                     "hiring_evidence_source": posting.hiring_evidence_url,
+                    "search_date": posting.search_date,
                     "location": posting.location,
                     "location_match": assessment.location_match,
                     "salary_min": posting.salary_min,

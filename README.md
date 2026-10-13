@@ -171,8 +171,8 @@ search result is a signal, not proof that a job remains open; confirm details on
 cited source or employer site. If the employer cannot be identified from the job result,
 those facts remain unverified.
 
-The CSV includes the posting title, company (when available), reported employee count
-and source, hiring signal and source, location, reported salary,
+The CSV includes the posting title, company (when available), date searched, reported
+employee count and source, hiring signal and source, location, reported salary,
 ATS-style `fit_score`, required/preferred coverage, qualification status, fit
 explanation, matching skills, gaps, description, source URL, an `apply_url` to the
 individual posting page, and link-check status/final URL. The Word report also includes
