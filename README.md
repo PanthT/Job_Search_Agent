@@ -182,6 +182,57 @@ agent does not extract a separate application-form URL. The agent checks each po
 with an HTTP GET request and follows redirects. A reachable link does not guarantee that
 the job is still open or that its page is genuine.
 
+## Search CADSI and AIAC member careers pages
+
+Run the separate member search to collect potential careers pages for companies listed
+in the [CADSI member directory](https://www.defenceandsecurity.ca/en/membership/members-list)
+and the [AIAC member directory](https://aiac.ca/membership/member-directory/):
+
+```sh
+python member_career_search.py
+```
+
+The script reads the current members from both directories, including CADSI's paginated
+list, and searches the web for each organization's careers page. It writes results to
+`member_careers.csv` by default. The `directory_url` column links to the member
+company's own website, selected from name-matching search results and checked against
+the site content. `company_website_verification` records the result of that check;
+`association_directory_url` is the CADSI or AIAC directory listing where the member
+was found. It then visits careers pages, follows up to 20
+likely job-posting links per careers page, and writes a separate `member_jobs.csv`
+containing the member, job title, description, experience requirement, salary, and
+posting URL when available. The jobs CSV also includes the member's `directory_url`
+and its verification status. The CSVs also include a LinkedIn company-page URL when a
+search result points to a LinkedIn company/showcase page and its name matches the
+member. Unmatched or missing pages are left blank and marked accordingly. Both CSVs
+include company-verification status: the script
+checks each careers page and job page for the member name in page content, structured
+employer data, or the link's domain. A `Not found` result means the company name was
+not detected; it does not prove that the link is unrelated. Structured job-posting
+data is preferred; fields that cannot be found are left blank. Pages that cannot be
+fetched and careers pages with no job links are noted in the jobs CSV status column.
+
+Search results are leads, not confirmed vacancies or proof that a careers page is
+operated by the member. Job-site layouts and JavaScript-driven application systems can
+prevent the script from finding every opening; review the linked posting before
+applying. Since searching every member generates many web searches and page requests,
+use `--limit` for a smaller run and `--output` / `--jobs-output` to choose CSV paths:
+Names with accents are transliterated in web-search queries to avoid backend encoding
+errors; the original member names are preserved in the CSVs and verification checks.
+
+```sh
+python member_career_search.py \
+  --limit 25 \
+  --output ./results/member_careers.csv \
+  --jobs-output ./results/member_jobs.csv
+```
+
+`--limit 0` (the default) searches every member; searches and page requests pause
+briefly between requests. `--max-job-pages` adjusts the per-careers-page posting limit.
+Member-search errors are recorded in the careers CSV, while job-page errors are
+recorded in the jobs CSV. The command exits with a nonzero status if any search or
+page request failed.
+
 ## Search limits and privacy
 
 Web search is accessed through LangChain's community integration and does not require
