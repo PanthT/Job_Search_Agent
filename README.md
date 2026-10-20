@@ -194,15 +194,42 @@ python member_career_search.py
 
 The script reads the current members from both directories, including CADSI's paginated
 list, and searches the web for each organization's careers page. It writes results to
-`member_careers.csv` by default. The `directory_url` column links to the member
+`member_careers.csv` by default. The `member_website` column links to the member
 company's own website, selected from name-matching search results and checked against
-the site content. `company_website_verification` records the result of that check;
+the site content. `directory_url` contains the same URL for backwards compatibility,
+and `company_website_verification` records the result of that check;
 `association_directory_url` is the CADSI or AIAC directory listing where the member
 was found. It then visits careers pages, follows up to 20
 likely job-posting links per careers page, and writes a separate `member_jobs.csv`
 containing the member, job title, description, experience requirement, salary, and
-posting URL when available. The jobs CSV also includes the member's `directory_url`
-and its verification status. The CSVs also include a LinkedIn company-page URL when a
+posting URL when available. The jobs CSV also includes the member's `member_website`
+(`directory_url` is retained as a backwards-compatible alias) and its verification
+status. Re-run `python member_career_search.py` to regenerate both CSVs with the
+website columns. To produce the separately verified jobs CSV as well, run
+`python verify_member_jobs.py --input member_jobs.csv --output member_jobs_verified.csv`.
+
+Company-site-only filtering is enabled by default (`--company-site-only`): careers
+pages and crawled job links on generic job boards / aggregators (LinkedIn, Indeed,
+Glassdoor, SimplyHired, Workopolis, Built In, ClearanceJobs, and similar) are
+dropped so results point at each member's own website. Postings on the member's own
+domain — including company-owned subdomains such as `jobs.company.com` — are kept,
+as are company-specific hiring pipelines (Greenhouse, Lever, Ashby, Workday /
+myworkdayjobs, SmartRecruiters, Dayforce, and similar). Filtered job-board links are
+kept in the jobs CSV with the status `Filtered: job board link, not on company
+website` rather than silently deleted. Use `--no-company-site-only` to restore the
+old behaviour of keeping every crawled link.
+
+To retroactively filter a CSV you already generated, use the helper script (it marks
+filtered rows by default; pass `--drop-filtered` to remove them instead):
+
+```sh
+python filter_company_site_jobs.py
+python filter_company_site_jobs.py \
+  --input member_jobs.csv \
+  --output member_jobs_company_site.csv \
+  --drop-filtered
+```
+The CSVs also include a LinkedIn company-page URL when a
 search result points to a LinkedIn company/showcase page and its name matches the
 member. Unmatched or missing pages are left blank and marked accordingly. Both CSVs
 include company-verification status: the script

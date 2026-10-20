@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import http.client as http_client
 import json
 import logging
 import re
@@ -65,6 +66,145 @@ SALARY_PATTERN = re.compile(
 )
 MAX_JOB_PAGES_PER_SITE = 20
 MAX_DESCRIPTION_LENGTH = 20_000
+
+# Hosts that aggregate postings for many employers. Jobs on these domains are
+# not on the member's own website, so company-site-only filtering drops them.
+# ATS hosts (greenhouse, lever, ashby, workday, etc.) are intentionally NOT
+# listed here: a posting like boards.greenhouse.io/<company>/... is the
+# member's own hiring pipeline, not a generic board.
+JOB_BOARD_HOSTS = (
+    "linkedin.com",
+    "indeed.com",
+    "glassdoor.com",
+    "simplyhired.com",
+    "ziprecruiter.com",
+    "workopolis.com",
+    "monster.com",
+    "careerbuilder.com",
+    "jobbank.gc.ca",
+    "eluta.ca",
+    "jobboom.com",
+    "jobillico.com",
+    "job-boards.greenhouse.io",
+    "builtin.com",
+    "jobera.com",
+    "clearancejobs.com",
+    "defencejobs.org",
+    "facebook.com",
+    "instagram.com",
+    "x.com",
+    "twitter.com",
+    "youtube.com",
+    "google.com",
+    "bing.com",
+    "duckduckgo.com",
+)
+
+# Company-website search should also skip the association directories.
+COMPANY_SITE_SEARCH_EXCLUDED_HOSTS = JOB_BOARD_HOSTS + (
+    "defenceandsecurity.ca",
+    "aiac.ca",
+)
+
+
+def _hostname(url: str) -> str:
+    """Return the lower-cased hostname without a leading www., or ''."""
+    try:
+        return (urlparse(url).hostname or "").casefold().removeprefix("www.")
+    except Exception:
+        return ""
+
+
+def _is_job_board_host(host: str) -> bool:
+    """True when *host* is (or is a subdomain of) a known job board."""
+    host = (host or "").casefold().removeprefix("www.")
+    if not host:
+        return False
+    return any(host == board or host.endswith(f".{board}") for board in JOB_BOARD_HOSTS)
+
+
+def is_job_board_url(url: str) -> bool:
+    """True when *url* points at a generic job board / aggregator."""
+    return _is_job_board_host(_hostname(url))
+
+
+def _registrable_domain(host: str) -> str:
+    """Best-effort registrable domain (last two labels) for same-company checks."""
+    host = (host or "").casefold().removeprefix("www.")
+    parts = [part for part in host.split(".") if part]
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return host
+
+
+def is_company_site_url(url: str, company_website_url: str) -> bool:
+    """True when *url* lives on the same registrable domain as the company site.
+
+    Empty company site -> False. Job-board hosts never count, even if the
+    strings happen to match.
+    """
+    host = _hostname(url)
+    company_host = _hostname(company_website_url)
+    if not host or not company_host:
+        return False
+    if _is_job_board_host(host):
+        return False
+    return _registrable_domain(host) == _registrable_domain(company_host)
+
+
+# Company-specific hiring platforms: a posting like
+# <company>.myworkdayjobs.com or jobs.ashbyhq.com/<company>/... belongs to
+# that member's own pipeline, not a generic board, so company-site-only
+# filtering keeps it.
+ATS_HOSTS = (
+    "greenhouse.io",
+    "lever.co",
+    "ashbyhq.com",
+    "myworkdayjobs.com",
+    "workday.com",
+    "smartrecruiters.com",
+    "dayforcehcm.com",
+    "rippling.com",
+    "breezy.hr",
+    "workable.com",
+    "jazzhr.com",
+    "zoho.com",
+    "teamtailor.com",
+    "pinpoint-applicant.com",
+    "applicantstack.com",
+    "applytojob.com",
+    "careerplug.com",
+)
+
+
+def _is_ats_host(host: str) -> bool:
+    host = (host or "").casefold().removeprefix("www.")
+    if not host:
+        return False
+    return any(host == ats or host.endswith(f".{ats}") for ats in ATS_HOSTS)
+
+
+def is_company_job_url(
+    job_url: str, company_website_url: str, company_site_only: bool = True
+) -> bool:
+    """True when a crawled *job_url* counts as the member's own posting.
+
+    Empty job URLs (careers-page-only rows) pass through as True so callers
+    can keep them. Otherwise: job-board URLs are rejected, and when the
+    company website is known the job must share its registrable domain or
+    live on a company-specific ATS host.
+    """
+    if not job_url or not job_url.strip():
+        return True
+    if not company_site_only:
+        return True
+    if is_job_board_url(job_url):
+        return False
+    if not company_website_url or not company_website_url.strip():
+        return True
+    if is_company_site_url(job_url, company_website_url):
+        return True
+    return _is_ats_host(_hostname(job_url))
 
 
 class DirectoryParser(HTMLParser):
@@ -174,11 +314,14 @@ class JobPageParser(HTMLParser):
         self._current_link = ""
         self._link_text: list[str] = []
         self._current_heading: list[str] = []
+        self._skip_depth = 0  # inside script/style/noscript/template/head? no-head ok
 
     def handle_starttag(
         self, tag: str, attrs: list[tuple[str, str | None]]
     ) -> None:
         attributes = dict(attrs)
+        if tag in {"script", "style", "noscript", "template"}:
+            self._skip_depth += 1
         if tag == "script":
             self._script_type = attributes.get("type", "").casefold()
             self._script_content = []
@@ -211,6 +354,8 @@ class JobPageParser(HTMLParser):
             self._link_text = []
 
     def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript", "template"} and self._skip_depth:
+            self._skip_depth -= 1
         if tag == "script":
             if self._script_type == "application/ld+json":
                 self.jsonld.append("".join(self._script_content))
@@ -235,6 +380,18 @@ class JobPageParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._script_type == "application/ld+json":
             self._script_content.append(data)
+            return
+        if self._skip_depth:
+            return
+        stripped = data.strip()
+        if not stripped:
+            return
+        # skip inline CSS blobs and JS fragments that leak as text
+        if ("{" in stripped and "}" in stripped and
+                (";" in stripped or ":" in stripped) and len(stripped.split()) < 60):
+            return
+        if stripped.startswith(("var ", "window.", "(function", "function ",
+                                 "if(", "if (", "$(", "jQuery", "kendo.")):
             return
         self.text.append(data)
         if self._in_title or self._in_heading:
@@ -282,7 +439,18 @@ def _fetch_page(url: str) -> str:
         with urlopen(
             request, timeout=REQUEST_TIMEOUT, context=context
         ) as response:
-            return response.read().decode("utf-8", errors="replace")
+            try:
+                raw = response.read()
+            except http_client.IncompleteRead as exc:
+                # Server closed a chunked connection early (common on large
+                # ATS / career pages). Keep the bytes we received rather
+                # than crashing the run; parsers tolerate truncation.
+                raw = exc.partial or b""
+                if not raw:
+                    raise RuntimeError(
+                        f"Could not fetch directory page {url}: truncated response"
+                    ) from exc
+            return raw.decode("utf-8", errors="replace")
     except HTTPError as exc:
         raise RuntimeError(f"Could not fetch directory page {url}: HTTP {exc.code}") from exc
     except (URLError, TimeoutError) as python_error:
@@ -651,6 +819,10 @@ def _is_job_link(link: dict[str, str], base_url: str) -> bool:
         fragment=""
     ).geturl():
         return False
+    if is_job_board_url(url):
+        # Never follow links to generic job boards / aggregators; we only
+        # want postings on the member's own website (or its ATS pipeline).
+        return False
     path = parsed.path.rstrip("/") or "/"
     if JOB_SKIP_PATHS.search(parsed.path):
         return False
@@ -857,8 +1029,19 @@ def _create_web_search() -> Any:
     )
 
 
-def find_career_pages(search: Any, company: str) -> list[dict[str, str]]:
-    """Return search results that appear to be an organization's careers page."""
+def find_career_pages(
+    search: Any,
+    company: str,
+    company_website_url: str = "",
+    company_site_only: bool = True,
+) -> list[dict[str, str]]:
+    """Return search results that appear to be an organization's careers page.
+
+    When *company_site_only* is True, generic job-board / aggregator URLs are
+    dropped. When *company_website_url* is known, results are additionally
+    required to live on the same registrable domain as the company site
+    (company-owned ATS subdomains such as jobs.company.com still pass).
+    """
     query = f'"{_searchable_company_name(company)}" careers jobs official'
     try:
         results = search.results(query, max_results=8)
@@ -885,6 +1068,10 @@ def find_career_pages(search: Any, company: str) -> list[dict[str, str]]:
             continue
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        if company_site_only and is_job_board_url(url):
+            continue
+        if company_website_url and not is_company_site_url(url, company_website_url):
             continue
         text = f"{title} {snippet} {parsed.path}"
         if not CAREER_TERMS.search(text):
@@ -969,19 +1156,7 @@ def find_company_website(search: Any, company: str) -> dict[str, str]:
             f"{company!r}."
         )
 
-    excluded_hosts = (
-        "linkedin.com",
-        "indeed.com",
-        "glassdoor.com",
-        "workopolis.com",
-        "facebook.com",
-        "instagram.com",
-        "x.com",
-        "twitter.com",
-        "youtube.com",
-        "defenceandsecurity.ca",
-        "aiac.ca",
-    )
+    excluded_hosts = COMPANY_SITE_SEARCH_EXCLUDED_HOSTS
     for result in results:
         if not isinstance(result, dict):
             continue
@@ -1063,6 +1238,18 @@ def build_parser() -> argparse.ArgumentParser:
             f"(default: {MAX_JOB_PAGES_PER_SITE})."
         ),
     )
+    parser.add_argument(
+        "--company-site-only",
+        dest="company_site_only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Keep only careers pages and job links on the member's own "
+            "website (drops generic job boards such as LinkedIn, Indeed, "
+            "Glassdoor; default: enabled). Use --no-company-site-only to "
+            "restore the old behaviour."
+        ),
+    )
     return parser
 
 
@@ -1093,6 +1280,7 @@ def run(args: argparse.Namespace) -> int:
         "association",
         "member",
         "association_directory_url",
+        "member_website",
         "directory_url",
         "company_website_verification",
         "potential_careers_page",
@@ -1114,6 +1302,7 @@ def run(args: argparse.Namespace) -> int:
         "careers_page_url",
         "company_verification",
         "career_page_company_verification",
+        "member_website",
         "directory_url",
         "company_website_verification",
         "linkedin_company_page",
@@ -1142,13 +1331,8 @@ def run(args: argparse.Namespace) -> int:
 
             for index, member in enumerate(members, start=1):
                 searched += 1
-                try:
-                    career_pages = find_career_pages(search, member)
-                    search_error = ""
-                except RuntimeError as exc:
-                    career_pages = []
-                    search_error = str(exc)
-                    errors += 1
+                search_error = ""
+                company_site_only = getattr(args, "company_site_only", True)
                 try:
                     linkedin = find_company_linkedin(search, member)
                 except RuntimeError as exc:
@@ -1156,9 +1340,7 @@ def run(args: argparse.Namespace) -> int:
                         "url": "",
                         "verification": "Search failed",
                     }
-                    search_error = (
-                        f"{search_error}; {exc}" if search_error else str(exc)
-                    )
+                    search_error = str(exc)
                     errors += 1
                 try:
                     company_website = find_company_website(search, member)
@@ -1167,6 +1349,22 @@ def run(args: argparse.Namespace) -> int:
                         "url": "",
                         "verification": "Search failed",
                     }
+                    search_error = (
+                        f"{search_error}; {exc}" if search_error else str(exc)
+                    )
+                    errors += 1
+                # Find careers pages. Default (company_site_only=True) drops
+                # generic job boards; when the company website is known the
+                # careers page must also share its registrable domain.
+                try:
+                    career_pages = find_career_pages(
+                        search,
+                        member,
+                        company_website_url=company_website["url"],
+                        company_site_only=company_site_only,
+                    )
+                except RuntimeError as exc:
+                    career_pages = []
                     search_error = (
                         f"{search_error}; {exc}" if search_error else str(exc)
                     )
@@ -1204,10 +1402,22 @@ def run(args: argparse.Namespace) -> int:
                             job_row["linkedin_verification"] = linkedin[
                                 "verification"
                             ]
+                            job_row["member_website"] = company_website["url"]
                             job_row["directory_url"] = company_website["url"]
                             job_row["company_website_verification"] = (
                                 company_website["verification"]
                             )
+                            if company_site_only and job_row.get("job_url"):
+                                if not is_company_job_url(
+                                    job_row["job_url"], company_website["url"], True
+                                ):
+                                    job_row["status"] = (
+                                        "Filtered: job board link, not on "
+                                        "company website"
+                                    )
+                                    job_row["company_verification"] = (
+                                        "Filtered: job board link"
+                                    )
                             job_writer.writerow(job_row)
                             if job_row["status"] not in {
                                 "Found",
@@ -1219,6 +1429,7 @@ def run(args: argparse.Namespace) -> int:
                                 "association": association,
                                 "member": member,
                                 "association_directory_url": page_url,
+                                "member_website": company_website["url"],
                                 "directory_url": company_website["url"],
                                 "company_website_verification": (
                                     company_website["verification"]
@@ -1247,6 +1458,7 @@ def run(args: argparse.Namespace) -> int:
                             "association": association,
                             "member": member,
                             "association_directory_url": page_url,
+                            "member_website": company_website["url"],
                             "directory_url": company_website["url"],
                             "company_website_verification": (
                                 company_website["verification"]

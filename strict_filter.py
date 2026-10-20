@@ -2,8 +2,11 @@ import csv
 from urllib.parse import urlparse
 from collections import Counter
 
-GENERIC_HOSTS = {"linkedin.com", "indeed.com", "workopolis.com",
-                 "glassdoor.com", "simplyhired.com", "ziprecruiter.com"}
+import member_career_search as mcs
+
+GENERIC_HOSTS = set(mcs.JOB_BOARD_HOSTS)
+
+FILTERED_PREFIX = "Filtered:"
 
 def host(u):
     try:
@@ -20,6 +23,8 @@ with open("member_jobs_verified.csv", encoding="utf-8-sig") as f:
 
 real = []
 for r in rows:
+    if (r.get("status") or "").startswith(FILTERED_PREFIX):
+        continue
     if not (r["verified_on_company_website"].startswith("Verified")
             and r["status"] == "Found"
             and r["job_title"].strip() and r["job_url"].strip()):

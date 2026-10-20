@@ -164,6 +164,100 @@ class CareerSearchTests(unittest.TestCase):
 
         self.assertEqual(career_search.find_career_pages(search, "Unknown"), [])
 
+    def test_find_career_pages_drops_job_boards(self):
+        search = FakeSearch(
+            [
+                {
+                    "title": "Example Careers",
+                    "link": "https://careers.example.com/",
+                    "snippet": "Join our team",
+                },
+                {
+                    "title": "Example jobs at LinkedIn",
+                    "link": "https://www.linkedin.com/company/example/jobs/",
+                    "snippet": "Join our team",
+                },
+                {
+                    "title": "Example job at Indeed",
+                    "link": "https://ca.indeed.com/viewjob?jk=abc",
+                    "snippet": "Join our team",
+                },
+            ]
+        )
+
+        results = career_search.find_career_pages(search, "Example Company")
+
+        self.assertEqual(
+            [result["url"] for result in results],
+            ["https://careers.example.com/"],
+        )
+
+    def test_find_career_pages_opt_out_keeps_job_boards(self):
+        search = FakeSearch(
+            [
+                {
+                    "title": "Example jobs",
+                    "link": "https://www.linkedin.com/company/example/jobs/",
+                    "snippet": "Join our team",
+                },
+            ]
+        )
+
+        results = career_search.find_career_pages(
+            search, "Example Company", company_site_only=False
+        )
+
+        self.assertEqual(len(results), 1)
+
+    def test_find_career_pages_requires_company_domain_when_known(self):
+        search = FakeSearch(
+            [
+                {
+                    "title": "Unrelated Careers",
+                    "link": "https://careers.unrelated.com/",
+                    "snippet": "Example Company careers",
+                },
+                {
+                    "title": "Example Careers",
+                    "link": "https://careers.example.com/",
+                    "snippet": "Join our team",
+                },
+            ]
+        )
+
+        results = career_search.find_career_pages(
+            search, "Example Company", company_website_url="https://example.com/"
+        )
+
+        self.assertEqual(
+            [result["url"] for result in results],
+            ["https://careers.example.com/"],
+        )
+
+    def test_is_company_job_url_allows_ats_and_rejects_boards(self):
+        self.assertTrue(
+            career_search.is_company_job_url(
+                "https://jobs.example.com/openings/1", "https://example.com/", True
+            )
+        )
+        self.assertTrue(
+            career_search.is_company_job_url(
+                "https://example.myworkdayjobs.com/en-US/job1",
+                "https://example.com/",
+                True,
+            )
+        )
+        self.assertFalse(
+            career_search.is_company_job_url(
+                "https://ca.indeed.com/viewjob?jk=abc", "https://example.com/", True
+            )
+        )
+        self.assertFalse(
+            career_search.is_company_job_url(
+                "https://other-company.com/jobs/1", "https://example.com/", True
+            )
+        )
+
     def test_search_transliterates_member_name_to_ascii(self):
         search = FakeSearch([])
 
@@ -245,7 +339,7 @@ class CareerSearchTests(unittest.TestCase):
                         career_search,
                         "find_company_website",
                         return_value={
-                            "url": "https://example-company.com/",
+                            "url": "https://example.com/",
                             "verification": "Found in page content",
                         },
                     ),
@@ -268,7 +362,11 @@ class CareerSearchTests(unittest.TestCase):
         )
         self.assertEqual(
             [row["directory_url"] for row in rows],
-            ["https://example-company.com/"] * 2,
+            ["https://example.com/"] * 2,
+        )
+        self.assertEqual(
+            [row["member_website"] for row in rows],
+            ["https://example.com/"] * 2,
         )
         self.assertEqual(
             [row["company_website_verification"] for row in rows],
@@ -301,6 +399,10 @@ class CareerSearchTests(unittest.TestCase):
         self.assertEqual(
             [row["linkedin_verification"] for row in job_rows],
             ["Name matched in LinkedIn search result"] * 2,
+        )
+        self.assertEqual(
+            [row["member_website"] for row in job_rows],
+            ["https://example.com/"] * 2,
         )
         self.assertEqual(
             progress.getvalue(),

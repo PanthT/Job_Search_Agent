@@ -1,4 +1,4 @@
-"""Verify member jobs by visiting the actual company website (directory_url)."""
+"""Verify member jobs by visiting the member's company website."""
 from __future__ import annotations
 import argparse
 import csv
@@ -15,16 +15,33 @@ def _host(url: str) -> str:
         return ""
 
 
-def _fetch_parser(url: str):
+def _parse(page: str):
     parser = mcs.JobPageParser()
-    parser.feed(mcs._fetch_page(url))
+    parser.feed(page)
     return parser
+
+
+def _fetch_parser(url: str):
+    try:
+        return _parse(mcs._fetch_page(url))
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        # Network-level failures (http.client.IncompleteRead,
+        # RemoteDisconnected, socket errors, SSL errors, ...) must not kill
+        # a multi-thousand-row verification run; surface them as fetch errors.
+        raise RuntimeError(f"Could not fetch {url}: {exc}") from exc
+
+
 def verify_row(row: dict, site_cache: dict, fast: bool = False) -> dict:
     member = row.get("member", "")
-    directory_url = (row.get("directory_url") or "").strip()
+    directory_url = (
+        row.get("member_website") or row.get("directory_url") or ""
+    ).strip()
     careers_url = (row.get("careers_page_url") or "").strip()
     job_url = (row.get("job_url") or "").strip()
     out = dict(row)
+    out["member_website"] = directory_url
     out["website_fetch"] = ""
     out["website_mentions_company"] = ""
     out["website_links_to_careers"] = ""
@@ -104,13 +121,19 @@ def verify_row(row: dict, site_cache: dict, fast: bool = False) -> dict:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Verify member_jobs.csv on actual company websites.")
+    ap = argparse.ArgumentParser(
+        description="Verify member_jobs.csv on the member companies' websites."
+    )
     ap.add_argument("--input", type=Path, default=Path("member_jobs.csv"))
     ap.add_argument("--output", type=Path, default=Path("member_jobs_verified.csv"))
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--fast", action="store_true",
-                    help="Only visit company websites (directory_url); reuse "
+                    help="Only visit company websites (member_website); reuse "
                          "existing careers/job verification from input CSV.")
+    ap.add_argument("--resume", action="store_true",
+                    help="Skip rows already present in the output file "
+                         "(match on member+job_title+job_url) and append new "
+                         "results, so an interrupted run can continue.")
     args = ap.parse_args()
     with args.input.open(encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
@@ -119,14 +142,51 @@ def main() -> int:
     extra = ["website_fetch", "website_mentions_company", "website_links_to_careers",
              "careers_page_recheck", "job_page_recheck", "job_page_mentions_company",
              "job_page_mentions_title", "verified_on_company_website"]
+    fieldnames = list(rows[0].keys())
+    if "member_website" not in fieldnames:
+        fieldnames.append("member_website")
+    fieldnames.extend(extra)
     site_cache: dict = {}
-    verified = []
+    if args.resume and args.output.exists():
+        with args.output.open(encoding="utf-8-sig") as f:
+            done = list(csv.DictReader(f))
+        done_keys = {
+            ((r.get("member") or ""), (r.get("job_title") or ""),
+             (r.get("job_url") or "")) for r in done
+        }
+        pending = [
+            r for r in rows
+            if ((r.get("member") or ""), (r.get("job_title") or ""),
+                (r.get("job_url") or "")) not in done_keys
+        ]
+        print(f"Resuming: {len(done)} rows already verified, "
+              f"{len(pending)} remaining.", flush=True)
+        if pending and list(done and done[0].keys() or []) != fieldnames:
+            print("Warning: existing output columns differ; "
+                  "appending with current columns.", flush=True)
+        verified = done
+        rows = pending
+    else:
+        verified = []
+    checkpoint_every = 50
     for i, row in enumerate(rows, 1):
-        verified.append(verify_row(row, site_cache, fast=args.fast))
-        if i % 50 == 0:
+        try:
+            verified.append(verify_row(row, site_cache, fast=args.fast))
+        except Exception as exc:  # last-resort guard: never kill the run
+            fallback = dict(row)
+            for column in extra:
+                fallback[column] = ""
+            fallback["website_fetch"] = f"Unexpected error: {exc}"[:300]
+            fallback["verified_on_company_website"] = "Not verified"
+            verified.append(fallback)
+        if i % checkpoint_every == 0:
             print(f"  {i}/{len(rows)}", flush=True)
+            with args.output.open("w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                w.writerows(verified)
     with args.output.open("w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) + extra)
+        w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(verified)
     from collections import Counter
