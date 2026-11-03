@@ -8,19 +8,22 @@ import html
 import http.client as http_client
 import json
 import logging
+import os
 import re
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
-
+import requests
 import certifi
 
 
@@ -104,6 +107,8 @@ JOB_BOARD_HOSTS = (
 COMPANY_SITE_SEARCH_EXCLUDED_HOSTS = JOB_BOARD_HOSTS + (
     "defenceandsecurity.ca",
     "aiac.ca",
+    "zoominfo.com", "crunchbase.com", "dnb.com", "getlatka.com",
+    "craft.co", "bloomberg.com", "pitchbook.com", "opencorporates.com",
 )
 
 
@@ -453,7 +458,7 @@ def _fetch_page(url: str) -> str:
             return raw.decode("utf-8", errors="replace")
     except HTTPError as exc:
         raise RuntimeError(f"Could not fetch directory page {url}: HTTP {exc.code}") from exc
-    except (URLError, TimeoutError) as python_error:
+    except (URLError, TimeoutError, OSError) as python_error:
         try:
             response = subprocess.run(
                 [
@@ -810,6 +815,15 @@ def _company_names_match(company: str, content: str) -> bool:
     return False
 
 
+def _host_matches_company(host: str, company: str) -> bool:
+    domain_label = (host or "").casefold().removeprefix("www.").split(".", 1)[0]
+    domain_label = _normalize_company_name(domain_label).replace(" ", "")
+    return any(
+        domain_label == variant.replace(" ", "")
+        for variant in _company_name_variants(company)
+    )
+
+
 def _is_job_link(link: dict[str, str], base_url: str) -> bool:
     url = urljoin(base_url, link["href"])
     parsed = urlparse(url)
@@ -1025,7 +1039,20 @@ def _create_web_search() -> Any:
             "Install project dependencies with 'pip install -r requirements.txt'."
         ) from exc
     return DuckDuckGoSearchAPIWrapper(
-        backend="bing,brave,google,mojeek,yahoo"
+        backend="duckduckgo,bing,brave,google,mojeek,yahoo"
+    )
+
+
+def _create_company_website_search() -> Any:
+    try:
+        from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+    except ImportError as exc:
+        raise RuntimeError(
+            "The LangChain DuckDuckGo integration is missing. "
+            "Install project dependencies with 'pip install -r requirements.txt'."
+        ) from exc
+    return DuckDuckGoSearchAPIWrapper(
+        backend="duckduckgo,bing,brave,google,mojeek,yahoo"
     )
 
 
@@ -1140,58 +1167,141 @@ def find_company_linkedin(search: Any, company: str) -> dict[str, str]:
 
 def find_company_website(search: Any, company: str) -> dict[str, str]:
     """Find a company website and check whether the page identifies the member."""
-    query = f'"{_searchable_company_name(company)}" official company website'
-    try:
-        results = search.results(query, max_results=8)
-    except Exception as exc:
-        if str(exc).strip().casefold().rstrip(".") == "no results found":
-            return {"url": "", "verification": "No matching website found"}
+    excluded_hosts = COMPANY_SITE_SEARCH_EXCLUDED_HOSTS
+    name = _searchable_company_name(company)
+    name_variants = _company_name_variants(name)
+    fallback_name = next(
+        (variant for variant in name_variants if variant.casefold() != name.casefold()),
+        "",
+    )
+    queries = list(
+        dict.fromkeys(
+            f'"{variant}" official company website'
+            for variant in (name, fallback_name)
+            if variant
+        )
+    )
+    unverified_match: dict[str, str] | None = None
+    search_errors: list[str] = []
+    completed_search = False
+
+    for query in queries:
+        try:
+            results = search.results(query, max_results=8)
+        except Exception as exc:
+            if str(exc).strip().casefold().rstrip(".") == "no results found":
+                completed_search = True
+                continue
+            search_errors.append(str(exc))
+            continue
+        if not isinstance(results, list):
+            search_errors.append("Search returned an unexpected response.")
+            continue
+        completed_search = True
+
+        candidates: list[tuple[str, str, bool, bool]] = []
+        seen_urls: set[str] = set()
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            url = result.get("link")
+            title = result.get("title")
+            snippet = result.get("snippet") or ""
+            if not isinstance(url, str) or not isinstance(title, str):
+                continue
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                continue
+            host = parsed.hostname.casefold().removeprefix("www.")
+            if any(
+                host == excluded or host.endswith(f".{excluded}")
+                for excluded in excluded_hosts
+            ):
+                continue
+            homepage_url = f"{parsed.scheme}://{parsed.netloc}/"
+            if homepage_url in seen_urls:
+                continue
+            seen_urls.add(homepage_url)
+            identifying_text = " ".join(
+                (title, str(snippet), host.replace(".", " "))
+            )
+            matched_result = _company_names_match(company, identifying_text)
+            domain_match = _host_matches_company(host, company)
+            official_result = matched_result and bool(
+                re.search(r"\b(official|homepage|home page|company website)\b",
+                          title, re.IGNORECASE)
+            )
+            candidates.append(
+                (url, homepage_url, domain_match, official_result)
+            )
+
+        candidates.sort(
+            key=lambda candidate: (not candidate[2], not candidate[3])
+        )
+        for url, homepage_url, domain_match, official_result in candidates[:5]:
+            try:
+                page = JobPageParser()
+                page.feed(_fetch_page(url))
+            except RuntimeError:
+                if (domain_match or official_result) and unverified_match is None:
+                    unverified_match = {
+                        "url": homepage_url,
+                        "verification": (
+                            "Name matched in search result; site not verified"
+                        ),
+                    }
+                continue
+            verification = verify_company_on_page(company, page, url)
+            # Brands can use abbreviated domains (e.g. Abipa International).
+            # Require the root page's own title, not a third-party body mention.
+            root_identity = False
+            if not (domain_match or official_result):
+                try:
+                    root_html = _fetch_page(homepage_url)
+                    root_title = re.search(r"<title[^>]*>(.*?)</title>", root_html, re.I | re.S)
+                    root_identity = bool(root_title and _company_names_match(company, html.unescape(root_title.group(1))))
+                except RuntimeError:
+                    pass
+            if verification != "Not found" and (domain_match or official_result or root_identity):
+                return {"url": homepage_url, "verification": verification}
+
+    if not completed_search and search_errors:
+        search_detail = "; ".join(search_errors)
+    else:
+        search_detail = ""
+    if search_detail:
+        _safe_print(
+            f"Company website search had no usable results for {company!r}; "
+            "checking common domains for compact company names.",
+            sys.stderr,
+        )
+    for variant in name_variants:
+        if " " in variant or not re.search(r"[a-z]", variant):
+            continue
+        suffixes = (".ai", ".com", ".ca", ".io") if re.search(
+            r"\d", variant
+        ) else (".com", ".ca", ".ai", ".io")
+        for suffix in suffixes:
+            url = f"https://www.{variant}{suffix}/"
+            try:
+                page = JobPageParser()
+                page.feed(_fetch_page(url))
+            except RuntimeError:
+                continue
+            verification = verify_company_on_page(company, page, url)
+            if verification in {
+                "Found in structured organization data",
+                "Found in page content",
+            }:
+                return {"url": url, "verification": verification}
+
+    if not completed_search and search_errors:
         raise RuntimeError(
             f"Company website search failed for {company!r}. Check network/search "
-            f"service availability. Details: {exc}"
-        ) from exc
-    if not isinstance(results, list):
-        raise RuntimeError(
-            f"Company website search returned an unexpected response for "
-            f"{company!r}."
+            f"service availability. Details: {'; '.join(search_errors)}"
         )
-
-    excluded_hosts = COMPANY_SITE_SEARCH_EXCLUDED_HOSTS
-    for result in results:
-        if not isinstance(result, dict):
-            continue
-        url = result.get("link")
-        title = result.get("title")
-        snippet = result.get("snippet") or ""
-        if not isinstance(url, str) or not isinstance(title, str):
-            continue
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            continue
-        host = parsed.hostname.casefold().removeprefix("www.")
-        if any(
-            host == excluded or host.endswith(f".{excluded}")
-            for excluded in excluded_hosts
-        ):
-            continue
-        identifying_text = " ".join(
-            (title, str(snippet), host.replace(".", " "))
-        )
-        if not _company_names_match(company, identifying_text):
-            continue
-
-        try:
-            page = JobPageParser()
-            page.feed(_fetch_page(url))
-        except RuntimeError:
-            return {
-                "url": url,
-                "verification": "Name matched in search result; site not verified",
-            }
-        verification = verify_company_on_page(company, page, url)
-        if verification == "Not found":
-            verification = "Name matched in search result; not found on site"
-        return {"url": url, "verification": verification}
+    if unverified_match:
+        return unverified_match
     return {"url": "", "verification": "No matching website found"}
 
 
@@ -1250,7 +1360,164 @@ def build_parser() -> argparse.ArgumentParser:
             "restore the old behaviour."
         ),
     )
+    parser.add_argument(
+        "--websites-only",
+        action="store_true",
+        help=(
+            "Write member_careers.csv with every CADSI and AIAC member and "
+            "search for company websites with DuckDuckGo first and alternate "
+            "backends as fallback; do not search careers pages or modify the "
+            "jobs CSV."
+        ),
+    )
     return parser
+
+
+def _write_member_websites(
+    args: argparse.Namespace,
+    member_groups: list[tuple[str, str, list[str]]],
+    fieldnames: list[str],
+) -> int:
+    website_search = _create_company_website_search()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    errors = 0
+    found = 0
+    processed_associations = {association for association, _, _ in member_groups}
+    existing_by_member: dict[tuple[str, str], dict[str, str]] = {}
+    preserved_rows: list[dict[str, str]] = []
+    if args.output.exists():
+        with args.output.open(encoding="utf-8-sig", newline="") as source_csv:
+            existing_reader = csv.DictReader(source_csv)
+            existing_fieldnames = existing_reader.fieldnames or []
+            fieldnames = list(dict.fromkeys(fieldnames + existing_fieldnames))
+            for existing_row in existing_reader:
+                key = (
+                    existing_row.get("association", ""),
+                    existing_row.get("member", ""),
+                )
+                if key[0] in processed_associations:
+                    existing_by_member[key] = existing_row
+                else:
+                    preserved_rows.append(existing_row)
+
+    temporary_path: Path | None = None
+
+    def lookup(
+        item: tuple[str, str],
+    ) -> tuple[dict[str, str], str]:
+        association, member = item
+        existing_row = existing_by_member.get((association, member), {})
+        existing_website = (
+            existing_row.get("member_website")
+            or existing_row.get("directory_url")
+            or ""
+        ).strip()
+        if (
+            existing_website
+            and existing_row.get("company_website_verification")
+            in {"Found in page content", "Found in domain"}
+        ):
+            return {
+                "url": existing_website,
+                "verification": existing_row[
+                    "company_website_verification"
+                ],
+            }, ""
+        try:
+            return find_company_website(website_search, member), ""
+        except RuntimeError as exc:
+            return {"url": "", "verification": "Search failed"}, str(exc)
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            newline="",
+            encoding="utf-8-sig",
+            dir=args.output.parent,
+            prefix=f".{args.output.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as career_csv:
+            temporary_path = Path(career_csv.name)
+            career_writer = csv.DictWriter(career_csv, fieldnames=fieldnames)
+            career_writer.writeheader()
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                for association, page_url, members in member_groups:
+                    results = executor.map(
+                        lookup, ((association, member) for member in members)
+                    )
+                    for index, (member, result) in enumerate(
+                        zip(members, results), start=1
+                    ):
+                        company_website, search_error = result
+                        if search_error:
+                            errors += 1
+                        existing_row = existing_by_member.get(
+                            (association, member), {}
+                        )
+                        website_url = (
+                            company_website["url"]
+                            or existing_row.get("member_website", "")
+                            or existing_row.get("directory_url", "")
+                        )
+                        website_verification = (
+                            company_website["verification"]
+                            if company_website["url"]
+                            else existing_row.get(
+                                "company_website_verification",
+                                company_website["verification"],
+                            )
+                        )
+                        if website_url:
+                            found += 1
+                        row = {
+                            "potential_careers_page": "",
+                            "search_result_title": "",
+                            "search_snippet": "",
+                            "company_verification": "Not checked",
+                            "linkedin_company_page": "",
+                            "linkedin_verification": "",
+                            **existing_row,
+                        }
+                        row.update(
+                            {
+                                "association": association,
+                                "member": member,
+                                "association_directory_url": page_url,
+                                "member_website": website_url,
+                                "directory_url": website_url,
+                                "company_website_verification": (
+                                    website_verification
+                                ),
+                                "search_error": search_error,
+                            }
+                        )
+                        career_writer.writerow(row)
+                        career_csv.flush()
+                        if index % 25 == 0 or index == len(members):
+                            _safe_print(
+                                f"{association} websites: "
+                                f"{index}/{len(members)}",
+                                sys.stderr,
+                            )
+            for row in preserved_rows:
+                career_writer.writerow(row)
+        assert temporary_path is not None
+        os.replace(temporary_path, args.output)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+    total = sum(len(members) for _, _, members in member_groups)
+    associations = " and ".join(
+        dict.fromkeys(association for association, _, _ in member_groups)
+    )
+    _safe_print(
+        f"Wrote {total} {associations} member websites to {args.output} "
+        f"({found} websites found, {errors} search errors).",
+        sys.stdout,
+    )
+    return 1 if errors else 0
 
 
 def run(args: argparse.Namespace) -> int:
@@ -1264,6 +1531,7 @@ def run(args: argparse.Namespace) -> int:
     if args.output.resolve() == args.jobs_output.resolve():
         raise ValueError("--output and --jobs-output must be different files")
 
+    websites_only = getattr(args, "websites_only", False)
     directories = (
         ("CADSI", "cadsi", CADSI_DIRECTORY_URL),
         ("AIAC", "aiac", AIAC_DIRECTORY_URL),
@@ -1275,7 +1543,6 @@ def run(args: argparse.Namespace) -> int:
             members = members[: args.limit]
         member_groups.append((association, page_url, members))
 
-    search = _create_web_search()
     fieldnames = [
         "association",
         "member",
@@ -1291,6 +1558,11 @@ def run(args: argparse.Namespace) -> int:
         "linkedin_verification",
         "search_error",
     ]
+    if websites_only:
+        return _write_member_websites(args, member_groups, fieldnames)
+
+    search = _create_web_search()
+    website_search = _create_company_website_search()
     job_fieldnames = [
         "association",
         "member",
@@ -1343,7 +1615,9 @@ def run(args: argparse.Namespace) -> int:
                     search_error = str(exc)
                     errors += 1
                 try:
-                    company_website = find_company_website(search, member)
+                    company_website = find_company_website(
+                        website_search, member
+                    )
                 except RuntimeError as exc:
                     company_website = {
                         "url": "",
@@ -1498,6 +1772,24 @@ def main() -> int:
     except (RuntimeError, ValueError) as exc:
         _safe_print(f"Error: {exc}", sys.stderr)
         return 1
+
+def get_company_website(company_name):
+    duckduckgo_url = f"https://duckduckgo.com/?q={company_name}+website"
+    response = requests.get(duckduckgo_url)
+    data = response.json()
+    if "Link" in data["RelatedTopics"]:
+        return data["RelatedTopics"]["Link"]
+    else:
+        return None
+
+def member_career_search(member_id):
+    # ... rest of the function remains the same ...
+
+    company_website = get_company_website(member_name)
+    if company_website:
+        print(f"Company website: {company_website}")
+    else:
+        print(f"Company website not found for {member_name}")
 
 
 if __name__ == "__main__":

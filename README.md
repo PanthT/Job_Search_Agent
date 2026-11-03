@@ -195,19 +195,54 @@ python member_career_search.py
 The script reads the current members from both directories, including CADSI's paginated
 list, and searches the web for each organization's careers page. It writes results to
 `member_careers.csv` by default. The `member_website` column links to the member
-company's own website, selected from name-matching search results and checked against
-the site content. `directory_url` contains the same URL for backwards compatibility,
-and `company_website_verification` records the result of that check;
+company's own website, searched on DuckDuckGo and checked against the site content.
+`directory_url` contains the same URL for backwards compatibility, and
+`company_website_verification` records the result of that check;
 `association_directory_url` is the CADSI or AIAC directory listing where the member
 was found. It then visits careers pages, follows up to 20
 likely job-posting links per careers page, and writes a separate `member_jobs.csv`
 containing the member, job title, description, experience requirement, salary, and
 posting URL when available. The jobs CSV also includes the member's `member_website`
 (`directory_url` is retained as a backwards-compatible alias) and its verification
-status. Re-run `python member_career_search.py` to regenerate both CSVs with the
-website columns. To produce the separately verified jobs CSV as well, run
+status. Website lookup retries with the member name without its legal suffix when
+needed, and verifies candidate sites directly even if search-result text omits the
+member name. A website remains blank when search results and candidate page content
+do not identify the member. Re-run
+`python member_career_search.py` to regenerate both CSVs with the website columns.
+To produce the separately verified jobs CSV as well, run
 `python verify_member_jobs.py --input member_jobs.csv --output member_jobs_verified.csv`.
+The verification script visits only each member's `member_website`; it does not open
+careers-page or job-posting URLs. Its verified CSV omits the `careers_page_url` and
+`job_url` columns; those links remain in the original `member_jobs.csv`.
 
+To search the likely company homepages in a separate CSV for careers pages, run:
+
+```sh
+python find_company_careers.py
+```
+
+This reads `likely_company_homepages.csv` and writes `company_career_pages.csv`.
+Search results are limited to the company's domain and exclude generic job boards.
+They are search leads, not independently verified career pages. Use `--input`,
+`--output`, `--limit`, and `--delay` to customize the run.
+
+To refresh the careers CSV with all CADSI and AIAC members and search for company
+websites using DuckDuckGo first (with alternate search backends if needed), without
+crawling careers pages or changing the jobs CSV, run:
+
+```sh
+python member_career_search.py --websites-only
+```
+
+To build `likely_company_homepages.csv` with one record for every member, including
+members whose homepage is still unknown or unverified, run:
+
+```sh
+python build_likely_company_homepages.py
+```
+
+The builder preserves existing career-page and LinkedIn enrichment columns. Refresh
+the source records first with `python member_career_search.py --websites-only`.
 Company-site-only filtering is enabled by default (`--company-site-only`): careers
 pages and crawled job links on generic job boards / aggregators (LinkedIn, Indeed,
 Glassdoor, SimplyHired, Workopolis, Built In, ClearanceJobs, and similar) are
@@ -254,6 +289,45 @@ python member_career_search.py \
   --jobs-output ./results/member_jobs.csv
 ```
 
+To add career-page results and name-matched LinkedIn company pages to
+`likely_company_homepages.csv`, run:
+
+```sh
+python enrich_company_homepages.py
+```
+
+This updates the input CSV in place and preserves its existing columns. Career pages
+are read from `company_career_pages.csv`; regenerate that file with
+`python find_company_careers.py` before enriching if you want to refresh those
+results. LinkedIn pages are searched and included only when the result identifies
+the member. Use `--limit` to limit LinkedIn lookups, or `--input` and
+`--career-results` to use other CSV paths. Re-running retries prior LinkedIn search
+failures without repeating completed no-match searches; pass `--retry-no-match` to
+retry those as well.
+
+To collect public recruiting contact channels from the careers pages listed in
+`likely_company_homepages.csv`, run:
+
+```sh
+python find_career_contacts.py
+```
+
+This writes one row per company to `company_career_contacts.csv`, extracting
+publicly displayed email addresses, phone numbers, and contact-page links. It does
+not infer or generate contact details. Rows without a listed careers URL are marked
+accordingly; fetch errors are recorded in the output.
+
+To also look for general company and HR/recruiting emails on company homepages,
+careers pages, and linked first-party contact/about pages, run:
+
+```sh
+python find_company_contact_emails.py
+```
+
+This writes `company_contact_emails.csv`, including the page URLs where emails
+were found. It only reports publicly displayed addresses and labels companies
+without a listed company or careers URL separately.
+
 `--limit 0` (the default) searches every member; searches and page requests pause
 briefly between requests. `--max-job-pages` adjusts the per-careers-page posting limit.
 Member-search errors are recorded in the careers CSV, while job-page errors are
@@ -263,8 +337,9 @@ page request failed.
 ## Search limits and privacy
 
 Web search is accessed through LangChain's community integration and does not require
-an API key. It uses selected search engines instead of `ddgs`'s automatic mode, which
-can query unrelated engines such as Wikipedia and fail when those hosts are unavailable.
+an API key. The member-careers search explicitly includes DuckDuckGo along with other
+selected search engines instead of `ddgs`'s automatic mode, which can query unrelated
+engines such as Wikipedia and fail when those hosts are unavailable.
 If an individual query produces no results, the agent continues through the remaining
 queries. If all configured backends fail due to network/DNS issues, it reports the
 connection error rather than treating it as an empty search. The `langchain-community`

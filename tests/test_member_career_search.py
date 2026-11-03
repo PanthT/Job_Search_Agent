@@ -23,6 +23,28 @@ class FakeSearch:
         return self.search_results
 
 
+class WebSearchConfigurationTests(unittest.TestCase):
+    def test_web_search_includes_duckduckgo_first(self):
+        with patch(
+            "langchain_community.utilities.DuckDuckGoSearchAPIWrapper"
+        ) as search_wrapper:
+            career_search._create_web_search()
+
+        search_wrapper.assert_called_once_with(
+            backend="duckduckgo,bing,brave,google,mojeek,yahoo"
+        )
+
+    def test_company_website_search_uses_duckduckgo_first(self):
+        with patch(
+            "langchain_community.utilities.DuckDuckGoSearchAPIWrapper"
+        ) as search_wrapper:
+            career_search._create_company_website_search()
+
+        search_wrapper.assert_called_once_with(
+            backend="duckduckgo,bing,brave,google,mojeek,yahoo"
+        )
+
+
 class LoggingFakeSearch(FakeSearch):
     def results(self, query, max_results):
         print("Search result for Québec Énergie")
@@ -71,6 +93,27 @@ class DirectoryParserTests(unittest.TestCase):
             )
 
         self.assertEqual(page, "<html>directory page</html>")
+        self.assertEqual(run_curl.call_args.args[0][0], "curl")
+
+    def test_fetch_page_falls_back_to_curl_after_connection_reset(self):
+        response = Mock(
+            returncode=0,
+            stdout=b"<html>company website</html>",
+            stderr=b"",
+        )
+        with (
+            patch.object(
+                career_search,
+                "urlopen",
+                side_effect=ConnectionResetError("connection reset"),
+            ),
+            patch.object(
+                career_search.subprocess, "run", return_value=response
+            ) as run_curl,
+        ):
+            page = career_search._fetch_page("https://example.com/")
+
+        self.assertEqual(page, "<html>company website</html>")
         self.assertEqual(run_curl.call_args.args[0][0], "curl")
 
     def test_aiac_parser_reads_members_and_next_page(self):
@@ -279,6 +322,116 @@ class CareerSearchTests(unittest.TestCase):
             r"CADSI: 1/1 (Qu\xe9bec \xc9nergie)" + "\n",
         )
 
+    def test_websites_only_writes_both_associations_without_touching_jobs_csv(self):
+        search = FakeSearch([])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "members.csv"
+            jobs_output = Path(directory) / "jobs.csv"
+            with output.open("w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.DictWriter(
+                    csv_file,
+                    fieldnames=[
+                        "association",
+                        "member",
+                        "potential_careers_page",
+                        "member_website",
+                        "company_website_verification",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(
+                    [
+                        {
+                            "association": "CADSI",
+                            "member": "3dEYE Inc",
+                            "potential_careers_page": (
+                                "https://www.3deye.ai/careers"
+                            ),
+                            "member_website": "https://www.3deye.ai/",
+                            "company_website_verification": (
+                                "Found in page content"
+                            ),
+                        },
+                        {
+                            "association": "AIAC",
+                            "member": "Existing AIAC Member",
+                            "potential_careers_page": (
+                                "https://aiac.example/careers"
+                            ),
+                        },
+                    ]
+                )
+            args = argparse.Namespace(
+                output=output,
+                jobs_output=jobs_output,
+                limit=0,
+                delay=0,
+                max_job_pages=career_search.MAX_JOB_PAGES_PER_SITE,
+                websites_only=True,
+            )
+            with (
+                patch.object(
+                    career_search,
+                    "get_members",
+                    side_effect=[
+                        ["3dEYE Inc", "Other CADSI Member"],
+                        ["Existing AIAC Member"],
+                    ],
+                ) as get_members,
+                patch.object(
+                    career_search,
+                    "_create_company_website_search",
+                    return_value=search,
+                ),
+                patch.object(
+                    career_search,
+                    "find_company_website",
+                    side_effect=[
+                        {
+                            "url": "",
+                            "verification": "No matching website found",
+                        },
+                        {
+                            "url": "https://aiac.example/",
+                            "verification": "Found in page content",
+                        },
+                    ],
+                ) as find_website,
+            ):
+                result = career_search.run(args)
+
+            with output.open(encoding="utf-8-sig", newline="") as csv_file:
+                rows = list(csv.DictReader(csv_file))
+
+        self.assertEqual(
+            get_members.call_args_list,
+            [
+                call("cadsi", career_search.CADSI_DIRECTORY_URL),
+                call("aiac", career_search.AIAC_DIRECTORY_URL),
+            ],
+        )
+        self.assertEqual(find_website.call_count, 2)
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [(row["association"], row["member"]) for row in rows],
+            [
+                ("CADSI", "3dEYE Inc"),
+                ("CADSI", "Other CADSI Member"),
+                ("AIAC", "Existing AIAC Member"),
+            ],
+        )
+        self.assertEqual(rows[0]["member_website"], "https://www.3deye.ai/")
+        self.assertEqual(
+            rows[0]["potential_careers_page"],
+            "https://www.3deye.ai/careers",
+        )
+        self.assertEqual(rows[1]["member_website"], "")
+        self.assertEqual(
+            rows[2]["potential_careers_page"], "https://aiac.example/careers"
+        )
+        self.assertEqual(rows[2]["member_website"], "https://aiac.example/")
+        self.assertFalse(jobs_output.exists())
+
     def test_run_writes_career_results_for_both_directories(self):
         search = FakeSearch(
             [
@@ -308,6 +461,11 @@ class CareerSearchTests(unittest.TestCase):
                         side_effect=[["CADSI Example"], ["AIAC Example"]],
                     ),
                     patch.object(career_search, "_create_web_search", return_value=search),
+                    patch.object(
+                        career_search,
+                        "_create_company_website_search",
+                        return_value=search,
+                    ),
                     patch.object(
                         career_search,
                         "crawl_career_page",
@@ -431,6 +589,11 @@ class CareerSearchTests(unittest.TestCase):
                     ),
                     patch.object(
                         career_search, "_create_web_search", return_value=search
+                    ),
+                    patch.object(
+                        career_search,
+                        "_create_company_website_search",
+                        return_value=search,
                     ),
                 ):
                     result = career_search.run(args)
@@ -730,9 +893,107 @@ class CareerSearchTests(unittest.TestCase):
             ]
         )
 
+        with patch.object(
+            career_search,
+            "_fetch_page",
+            return_value="<html><title>Independent company</title></html>",
+        ):
+            result = career_search.find_company_website(search, "Acme Robotics")
+
         self.assertEqual(
-            career_search.find_company_website(search, "Acme Robotics"),
+            result,
             {"url": "", "verification": "No matching website found"},
+        )
+
+    def test_company_website_is_verified_from_page_when_search_result_omits_name(self):
+        search = FakeSearch(
+            [
+                {
+                    "title": "Official website",
+                    "link": "https://www.acmerobotics.example/about",
+                    "snippet": "Advanced autonomous systems",
+                }
+            ]
+        )
+        with patch.object(
+            career_search,
+            "_fetch_page",
+            return_value="<html><title>Acme Robotics</title></html>",
+        ):
+            result = career_search.find_company_website(search, "Acme Robotics")
+
+        self.assertEqual(
+            result,
+            {
+                "url": "https://www.acmerobotics.example/",
+                "verification": "Found in page content",
+            },
+        )
+
+    def test_company_website_rejects_third_party_mention_and_probes_brand_domain(self):
+        search = FakeSearch(
+            [
+                {
+                    "title": "3dEYE Inc. Revenue 2025 - getlatka.com",
+                    "link": "https://getlatka.com/companies/3deye.me",
+                    "snippet": "3dEYE Inc. estimated revenue",
+                }
+            ]
+        )
+
+        def fetch(url):
+            if url == "https://www.3deye.ai/":
+                return "<html><title>3dEYE cloud video platform</title></html>"
+            raise RuntimeError("No site")
+
+        with patch.object(career_search, "_fetch_page", side_effect=fetch):
+            result = career_search.find_company_website(search, "3dEYE Inc")
+
+        self.assertEqual(
+            result,
+            {
+                "url": "https://www.3deye.ai/",
+                "verification": "Found in page content",
+            },
+        )
+
+    def test_company_website_retries_search_without_legal_suffix(self):
+        class SequencedSearch:
+            def __init__(self):
+                self.queries = []
+
+            def results(self, query, max_results):
+                self.queries.append(query)
+                if len(self.queries) == 1:
+                    return []
+                return [
+                    {
+                        "title": "Acme Robotics official site",
+                        "link": "https://acme.example/",
+                        "snippet": "Acme Robotics",
+                    }
+                ]
+
+        search = SequencedSearch()
+        with patch.object(
+            career_search,
+            "_fetch_page",
+            return_value="<html><title>Acme Robotics</title></html>",
+        ):
+            result = career_search.find_company_website(
+                search, "Acme Robotics Inc."
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "url": "https://acme.example/",
+                "verification": "Found in page content",
+            },
+        )
+        self.assertEqual(len(search.queries), 2)
+        self.assertEqual(
+            search.queries[1], '"acme robotics" official company website'
         )
 
 
